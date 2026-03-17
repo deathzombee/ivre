@@ -61,7 +61,10 @@ except ImportError:
 from ivre import VERSION, config, flow, nmapout, passive, utils, xmlnmap
 from ivre.active.cpe import add_cpe_values
 from ivre.active.data import (
+    add_cert_hostnames,
     add_hostname,
+    create_ssl_cert,
+    create_ssl_output,
     handle_http_content,
     handle_http_headers,
     handle_tlsx_result,
@@ -71,9 +74,26 @@ from ivre.active.nmap import ALIASES_TABLE_ELEMS
 from ivre.analyzer.dns import nsrecord
 from ivre.data.microsoft.exchange import EXCHANGE_BUILDS
 from ivre.plugins import load_plugins
-from ivre.tags import add_tags, gen_addr_tags
+from ivre.tags import (
+    TAG_CDN,
+    TAG_HONEYPOT,
+    TAG_MALWARE,
+    TAG_SCANNER,
+    TAG_TOR,
+    add_tags,
+    gen_addr_tags,
+)
 from ivre.tags.active import set_auto_tags, set_openports_attribute
 from ivre.zgrabout import ZGRAB_PARSERS
+
+# Mapping from Shodan record tag strings to IVRE Tag base dicts
+_SHODAN_TAG_MAP = {
+    "cloud": TAG_CDN,
+    "honeypot": TAG_HONEYPOT,
+    "malware": TAG_MALWARE,
+    "scanner": TAG_SCANNER,
+    "tor": TAG_TOR,
+}
 
 
 class DB:
@@ -2333,6 +2353,8 @@ class DBNmap(DBActive):
                     store_scan_function = self.store_scan_json_tlsx
                 elif "input" in firstres:
                     store_scan_function = self.store_scan_json_httpx
+                elif "ip_str" in firstres:
+                    store_scan_function = self.store_scan_json_shodan
                 elif "ip" in firstres or "domain" in firstres:
                     store_scan_function = self.store_scan_json_zgrab
                 elif "name" in firstres:
@@ -3785,12 +3807,14 @@ class DBNmap(DBActive):
                 if rec.get("failed"):
                     continue
                 port = {
-                    "protocol": rec["transport"],
+                    "protocol": rec.get("transport", "tcp"),
                     "port": rec["port"],
                     "state_state": "open",
                     "state_reason": "response",
                 }
-                timestamp = rec["timestamp"][:19].replace("T", " ")
+                timestamp = (rec.get("timestamp") or "")[:19].replace("T", " ") or str(
+                    datetime.fromtimestamp(os.stat(fname).st_mtime)
+                )
                 host = {
                     "addr": rec["ip_str"],
                     "state": "up",
@@ -3833,6 +3857,29 @@ class DBNmap(DBActive):
                     port["service_product"] = rec["product"]
                 if "version" in rec:
                     port["service_version"] = rec["version"]
+                if rec.get("info"):
+                    port["service_extrainfo"] = rec["info"]
+                for dname in rec.get("domains", []):
+                    if dname:
+                        host.setdefault("hostnames", []).append(
+                            {
+                                "name": dname,
+                                "type": "Forward",
+                                "domains": list(utils.get_domains(dname)),
+                            }
+                        )
+                cpe_vals = list(rec.get("cpe23") or rec.get("cpe") or [])
+                if cpe_vals:
+                    add_cpe_values(
+                        host,
+                        f"ports.port:{rec['port']}",
+                        cpe_vals,
+                    )
+                    host["cpes"] = list(host["cpes"].values())
+                    for cpe in host["cpes"]:
+                        cpe["origins"] = sorted(cpe["origins"])
+                    if not host["cpes"]:
+                        del host["cpes"]
                 # TODO: find Nmap equivalent probe based on rec["_shodan"]["module"]
                 if rec.get("opts", {}).get("raw"):
                     raw_output = utils.decode_hex(rec["opts"]["raw"])
@@ -3877,11 +3924,350 @@ class DBNmap(DBActive):
                                 },
                             }
                         )
-                # remaining fields / TODO:
-                # data
-                # os
-                # _shodan / opts.raw
-                # tags (["cloud"]) / cloud
+                # Process the 'data' field when no binary opts.raw is available
+                elif "data" in rec:
+                    raw_output = rec["data"].encode()
+                    nmap_info = utils.match_nmap_svc_fp(
+                        output=raw_output,
+                        proto=port["protocol"],
+                    )
+                    if nmap_info:
+                        try:
+                            del nmap_info["soft"]
+                        except KeyError:
+                            pass
+                        add_cpe_values(
+                            host,
+                            f"ports.port:{rec['port']}",
+                            nmap_info.pop("cpe", []),
+                        )
+                        host["cpes"] = list(host["cpes"].values())
+                        for cpe in host["cpes"]:
+                            cpe["origins"] = sorted(cpe["origins"])
+                        if not host["cpes"]:
+                            del host["cpes"]
+                        port.update(nmap_info)
+                        xmlnmap.add_service_hostname(
+                            nmap_info,
+                            host.setdefault("hostnames", []),
+                        )
+                    banner = "".join(
+                        (
+                            chr(d)
+                            if 32 <= d <= 126 or d in {9, 10, 13}
+                            else "\\x%02x" % d
+                        )
+                        for d in raw_output
+                    )
+                    port.setdefault("scripts", []).append(
+                        {
+                            "id": "banner",
+                            "output": banner,
+                            "masscan": {
+                                "raw": utils.encode_b64(raw_output).decode(),
+                                "encoded": banner,
+                            },
+                        }
+                    )
+                # Process HTTP data from Shodan's structured 'http' field
+                if rec.get("http"):
+                    http_data = rec["http"]
+                    module = rec.get("_shodan", {}).get("module", "")
+                    if module in {"https", "https-simple-new"}:
+                        port["service_tunnel"] = "ssl"
+                    if not port.get("service_name"):
+                        port["service_name"] = "http"
+                    # Build structured headers list
+                    structured = []
+                    if "status_line" in http_data:
+                        structured.append(
+                            {"name": "_status", "value": http_data["status_line"]}
+                        )
+                    for hdrname, hdrval in http_data.get("headers", {}).items():
+                        # Shodan can serialize null JSON keys as the string "null"
+                        if not hdrname or hdrname == "null":
+                            continue
+                        if not isinstance(hdrval, str):
+                            hdrval = str(hdrval)
+                        structured.append(
+                            {"name": hdrname.lower(), "value": hdrval}
+                        )
+                    if structured and not any(
+                        s["id"] == "http-headers"
+                        for s in port.get("scripts", [])
+                    ):
+                        hdr_output = "\n".join(
+                            h["value"]
+                            if h["name"] == "_status"
+                            else f"{h['name']}: {h['value']}"
+                            for h in structured
+                        )
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-headers",
+                                "output": hdr_output + "\n\n(Request type: GET)",
+                                "http-headers": structured,
+                            }
+                        )
+                        handle_http_headers(host, port, structured)
+                    # Process HTML body
+                    html = http_data.get("html")
+                    if html and not any(
+                        s["id"] == "http-content"
+                        for s in port.get("scripts", [])
+                    ):
+                        body = html.encode()
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-content",
+                                "output": utils.nmap_encode_data(body),
+                            }
+                        )
+                        handle_http_content(host, port, body)
+                    elif "title" in http_data and not any(
+                        s["id"] == "http-title" for s in port.get("scripts", [])
+                    ):
+                        title = http_data["title"]
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-title",
+                                "output": title,
+                                "http-title": {"title": title},
+                            }
+                        )
+                # Handle top-level HTTP fields present in Shodan HTTP exports
+                # (when records lack a nested 'http' object)
+                if not rec.get("http"):
+                    if not port.get("service_name") and (
+                        rec.get("html") or rec.get("title") or rec.get("server")
+                    ):
+                        port["service_name"] = "http"
+                    # Build a minimal http-headers script from top-level server/status
+                    top_structured = []
+                    status_val = rec.get("status")
+                    if status_val is not None:
+                        top_structured.append(
+                            {"name": "_status", "value": f"HTTP/1.1 {status_val}"}
+                        )
+                    server_val = rec.get("server")
+                    if server_val:
+                        top_structured.append(
+                            {"name": "server", "value": server_val}
+                        )
+                    if top_structured and not any(
+                        s["id"] == "http-headers" for s in port.get("scripts", [])
+                    ):
+                        hdr_output = "\n".join(
+                            h["value"]
+                            if h["name"] == "_status"
+                            else f"{h['name']}: {h['value']}"
+                            for h in top_structured
+                        )
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-headers",
+                                "output": hdr_output + "\n\n(Request type: GET)",
+                                "http-headers": top_structured,
+                            }
+                        )
+                        handle_http_headers(host, port, top_structured)
+                    # Process top-level html as http-content
+                    top_html = rec.get("html")
+                    if top_html and not any(
+                        s["id"] == "http-content" for s in port.get("scripts", [])
+                    ):
+                        body = top_html.encode()
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-content",
+                                "output": utils.nmap_encode_data(body),
+                            }
+                        )
+                        handle_http_content(host, port, body)
+                    elif rec.get("title") and not any(
+                        s["id"] == "http-title" for s in port.get("scripts", [])
+                    ):
+                        title = rec["title"]
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-title",
+                                "output": title,
+                                "http-title": {"title": title},
+                            }
+                        )
+                # Process SSL data
+                if rec.get("ssl"):
+                    ssl_data = rec["ssl"]
+                    port["service_tunnel"] = "ssl"
+                    # Certificate — prefer the first PEM in the chain
+                    chain = ssl_data.get("chain", [])
+                    if chain:
+                        pem = chain[0]
+                        b64 = "".join(
+                            ln
+                            for ln in pem.splitlines()
+                            if not ln.startswith("-----")
+                        )
+                        try:
+                            output_cert, info_cert = create_ssl_cert(
+                                b64.encode(), b64encoded=True
+                            )
+                        except Exception:
+                            utils.LOGGER.warning(
+                                "Cannot parse Shodan SSL certificate",
+                                exc_info=True,
+                            )
+                        else:
+                            if info_cert and not any(
+                                s["id"] == "ssl-cert"
+                                for s in port.get("scripts", [])
+                            ):
+                                port.setdefault("scripts", []).append(
+                                    {
+                                        "id": "ssl-cert",
+                                        "output": output_cert,
+                                        "ssl-cert": info_cert,
+                                    }
+                                )
+                                for cert in info_cert:
+                                    add_cert_hostnames(
+                                        cert,
+                                        host.setdefault("hostnames", []),
+                                    )
+                    # JARM fingerprint
+                    jarm = ssl_data.get("jarm")
+                    if jarm and not any(
+                        s["id"] == "ssl-jarm" for s in port.get("scripts", [])
+                    ):
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "ssl-jarm",
+                                "output": jarm,
+                                "ssl-jarm": jarm,
+                            }
+                        )
+                # Process Wappalyzer-like tech detection from 'components'
+                components = rec.get("components") or rec.get("http", {}).get(
+                    "components"
+                )
+                if components and isinstance(components, dict):
+                    http_app_entries = []
+                    for app_name, app_data in components.items():
+                        if not isinstance(app_data, dict):
+                            continue
+                        structured: dict = {"application": app_name}
+                        versions = app_data.get("versions") or []
+                        if versions:
+                            structured["version"] = versions[0]
+                        http_app_entries.append(structured)
+                    if http_app_entries:
+                        existing = next(
+                            (
+                                s
+                                for s in port.get("scripts", [])
+                                if s["id"] == "http-app"
+                            ),
+                            None,
+                        )
+                        if existing is not None:
+                            existing_names = {
+                                a.get("application")
+                                for a in existing.get("http-app", [])
+                            }
+                            new_entries = [
+                                e
+                                for e in http_app_entries
+                                if e["application"] not in existing_names
+                            ]
+                            existing.setdefault("http-app", []).extend(new_entries)
+                        else:
+                            output = ", ".join(
+                                (
+                                    f"{e['application']} {e['version']}"
+                                    if "version" in e
+                                    else e["application"]
+                                )
+                                for e in http_app_entries
+                            )
+                            port.setdefault("scripts", []).append(
+                                {
+                                    "id": "http-app",
+                                    "output": output,
+                                    "http-app": http_app_entries,
+                                }
+                            )
+                # Process 'vulns' field — convert to IVRE's vulns NSE format
+                if rec.get("vulns") and isinstance(rec["vulns"], dict):
+                    vuln_list = []
+                    output_lines = []
+                    for cve_id, vuln in rec["vulns"].items():
+                        if not isinstance(vuln, dict):
+                            continue
+                        state = (
+                            "VULNERABLE"
+                            if vuln.get("verified")
+                            else "LIKELY VULNERABLE"
+                        )
+                        entry: dict = {"id": cve_id, "state": state}
+                        if vuln.get("summary"):
+                            entry["description"] = vuln["summary"]
+                        refs = vuln.get("references") or []
+                        if refs:
+                            # Shodan duplicates references; deduplicate
+                            seen: set = set()
+                            unique_refs: list = []
+                            for r in refs:
+                                if isinstance(r, str) and r not in seen:
+                                    seen.add(r)
+                                    unique_refs.append(r)
+                            if unique_refs:
+                                entry["refs"] = unique_refs
+                        scores: dict = {}
+                        if vuln.get("cvss_v2") is not None:
+                            scores["CVSSv2"] = str(vuln["cvss_v2"])
+                        # Shodan stores CVSSv3 in "cvss" (disambiguated by
+                        # "cvss_version" >= 3) and CVSSv2 in "cvss_v2"
+                        cvss = vuln.get("cvss")
+                        if cvss is not None and vuln.get("cvss_version", 0) >= 3:
+                            scores["CVSSv3"] = str(cvss)
+                        if scores:
+                            entry["scores"] = scores
+                        vuln_list.append(entry)
+                        output_lines.append(f"{cve_id}: {state}")
+                    if vuln_list and not any(
+                        s["id"] == "vulns" for s in port.get("scripts", [])
+                    ):
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "vulns",
+                                "output": "\n".join(output_lines),
+                                "vulns": vuln_list,
+                            }
+                        )
+                # Map Shodan record tags to IVRE tags
+                shodan_rec_tags = rec.get("tags")
+                if shodan_rec_tags:
+                    ivre_tags = []
+                    for tag in shodan_rec_tags:
+                        base = _SHODAN_TAG_MAP.get(tag)
+                        if base is not None:
+                            ivre_tags.append(
+                                dict(base, info=[f"Shodan tag: {tag}"])
+                            )
+                        else:
+                            ivre_tags.append(
+                                {
+                                    "value": tag,
+                                    "type": "info",
+                                    "info": [f"Shodan tag: {tag}"],
+                                }
+                            )
+                    add_tags(host, ivre_tags)
+                # Set OS information
+                if rec.get("os"):
+                    host.setdefault("os", {}).setdefault("osmatch", []).append(
+                        {"name": rec["os"], "accuracy": "100"}
+                    )
                 if categories:
                     host["categories"] = categories
                 if tags:

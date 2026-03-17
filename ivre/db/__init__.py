@@ -2353,6 +2353,8 @@ class DBNmap(DBActive):
                     store_scan_function = self.store_scan_json_tlsx
                 elif "input" in firstres:
                     store_scan_function = self.store_scan_json_httpx
+                elif "ip_str" in firstres:
+                    store_scan_function = self.store_scan_json_shodan
                 elif "ip" in firstres or "domain" in firstres:
                     store_scan_function = self.store_scan_json_zgrab
                 elif "name" in firstres:
@@ -3805,12 +3807,14 @@ class DBNmap(DBActive):
                 if rec.get("failed"):
                     continue
                 port = {
-                    "protocol": rec["transport"],
+                    "protocol": rec.get("transport", "tcp"),
                     "port": rec["port"],
                     "state_state": "open",
                     "state_reason": "response",
                 }
-                timestamp = rec["timestamp"][:19].replace("T", " ")
+                timestamp = (rec.get("timestamp") or "")[:19].replace("T", " ") or str(
+                    datetime.fromtimestamp(os.stat(fname).st_mtime)
+                )
                 host = {
                     "addr": rec["ip_str"],
                     "state": "up",
@@ -4024,6 +4028,66 @@ class DBNmap(DBActive):
                         s["id"] == "http-title" for s in port.get("scripts", [])
                     ):
                         title = http_data["title"]
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-title",
+                                "output": title,
+                                "http-title": {"title": title},
+                            }
+                        )
+                # Handle top-level HTTP fields present in Shodan HTTP exports
+                # (when records lack a nested 'http' object)
+                if not rec.get("http"):
+                    if not port.get("service_name") and (
+                        rec.get("html") or rec.get("title") or rec.get("server")
+                    ):
+                        port["service_name"] = "http"
+                    # Build a minimal http-headers script from top-level server/status
+                    top_structured = []
+                    status_val = rec.get("status")
+                    if status_val is not None:
+                        top_structured.append(
+                            {"name": "_status", "value": f"HTTP/1.1 {status_val}"}
+                        )
+                    server_val = rec.get("server")
+                    if server_val:
+                        top_structured.append(
+                            {"name": "server", "value": server_val}
+                        )
+                    if top_structured and not any(
+                        s["id"] == "http-headers" for s in port.get("scripts", [])
+                    ):
+                        hdr_output = "\n".join(
+                            h["value"]
+                            if h["name"] == "_status"
+                            else f"{h['name']}: {h['value']}"
+                            for h in top_structured
+                        )
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-headers",
+                                "output": hdr_output + "\n\n(Request type: GET)",
+                                "http-headers": top_structured,
+                            }
+                        )
+                        handle_http_headers(host, port, top_structured)
+                    # Process top-level html as http-content
+                    top_html = rec.get("html")
+                    if top_html and not any(
+                        s["id"] == "http-content" for s in port.get("scripts", [])
+                    ):
+                        body = top_html.encode()
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "http-content",
+                                "output": utils.nmap_encode_data(body),
+                            }
+                        )
+                        handle_http_content(host, port, body)
+                    elif rec.get("title") and not any(
+                        s["id"] == "http-title" for s in port.get("scripts", [])
+                    ):
+                        title = rec["title"]
                         port.setdefault("scripts", []).append(
                             {
                                 "id": "http-title",

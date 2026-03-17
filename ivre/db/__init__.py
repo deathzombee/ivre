@@ -61,7 +61,10 @@ except ImportError:
 from ivre import VERSION, config, flow, nmapout, passive, utils, xmlnmap
 from ivre.active.cpe import add_cpe_values
 from ivre.active.data import (
+    add_cert_hostnames,
     add_hostname,
+    create_ssl_cert,
+    create_ssl_output,
     handle_http_content,
     handle_http_headers,
     handle_tlsx_result,
@@ -3850,6 +3853,29 @@ class DBNmap(DBActive):
                     port["service_product"] = rec["product"]
                 if "version" in rec:
                     port["service_version"] = rec["version"]
+                if rec.get("info"):
+                    port["service_extrainfo"] = rec["info"]
+                for dname in rec.get("domains", []):
+                    if dname:
+                        host.setdefault("hostnames", []).append(
+                            {
+                                "name": dname,
+                                "type": "Forward",
+                                "domains": list(utils.get_domains(dname)),
+                            }
+                        )
+                cpe_vals = list(rec.get("cpe23") or rec.get("cpe") or [])
+                if cpe_vals:
+                    add_cpe_values(
+                        host,
+                        f"ports.port:{rec['port']}",
+                        cpe_vals,
+                    )
+                    host["cpes"] = list(host["cpes"].values())
+                    for cpe in host["cpes"]:
+                        cpe["origins"] = sorted(cpe["origins"])
+                    if not host["cpes"]:
+                        del host["cpes"]
                 # TODO: find Nmap equivalent probe based on rec["_shodan"]["module"]
                 if rec.get("opts", {}).get("raw"):
                     raw_output = utils.decode_hex(rec["opts"]["raw"])
@@ -4003,6 +4029,155 @@ class DBNmap(DBActive):
                                 "id": "http-title",
                                 "output": title,
                                 "http-title": {"title": title},
+                            }
+                        )
+                # Process SSL data
+                if rec.get("ssl"):
+                    ssl_data = rec["ssl"]
+                    port["service_tunnel"] = "ssl"
+                    # Certificate — prefer the first PEM in the chain
+                    chain = ssl_data.get("chain", [])
+                    if chain:
+                        pem = chain[0]
+                        b64 = "".join(
+                            ln
+                            for ln in pem.splitlines()
+                            if not ln.startswith("-----")
+                        )
+                        try:
+                            output_cert, info_cert = create_ssl_cert(
+                                b64.encode(), b64encoded=True
+                            )
+                        except Exception:
+                            utils.LOGGER.warning(
+                                "Cannot parse Shodan SSL certificate",
+                                exc_info=True,
+                            )
+                        else:
+                            if info_cert and not any(
+                                s["id"] == "ssl-cert"
+                                for s in port.get("scripts", [])
+                            ):
+                                port.setdefault("scripts", []).append(
+                                    {
+                                        "id": "ssl-cert",
+                                        "output": output_cert,
+                                        "ssl-cert": info_cert,
+                                    }
+                                )
+                                for cert in info_cert:
+                                    add_cert_hostnames(
+                                        cert,
+                                        host.setdefault("hostnames", []),
+                                    )
+                    # JARM fingerprint
+                    jarm = ssl_data.get("jarm")
+                    if jarm and not any(
+                        s["id"] == "ssl-jarm" for s in port.get("scripts", [])
+                    ):
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "ssl-jarm",
+                                "output": jarm,
+                                "ssl-jarm": jarm,
+                            }
+                        )
+                # Process Wappalyzer-like tech detection from 'components'
+                components = rec.get("components") or rec.get("http", {}).get(
+                    "components"
+                )
+                if components and isinstance(components, dict):
+                    http_app_entries = []
+                    for app_name, app_data in components.items():
+                        if not isinstance(app_data, dict):
+                            continue
+                        structured: dict = {"application": app_name}
+                        versions = app_data.get("versions") or []
+                        if versions:
+                            structured["version"] = versions[0]
+                        http_app_entries.append(structured)
+                    if http_app_entries:
+                        existing = next(
+                            (
+                                s
+                                for s in port.get("scripts", [])
+                                if s["id"] == "http-app"
+                            ),
+                            None,
+                        )
+                        if existing is not None:
+                            existing_names = {
+                                a.get("application")
+                                for a in existing.get("http-app", [])
+                            }
+                            new_entries = [
+                                e
+                                for e in http_app_entries
+                                if e["application"] not in existing_names
+                            ]
+                            existing.setdefault("http-app", []).extend(new_entries)
+                        else:
+                            output = ", ".join(
+                                (
+                                    f"{e['application']} {e['version']}"
+                                    if "version" in e
+                                    else e["application"]
+                                )
+                                for e in http_app_entries
+                            )
+                            port.setdefault("scripts", []).append(
+                                {
+                                    "id": "http-app",
+                                    "output": output,
+                                    "http-app": http_app_entries,
+                                }
+                            )
+                # Process 'vulns' field — convert to IVRE's vulns NSE format
+                if rec.get("vulns") and isinstance(rec["vulns"], dict):
+                    vuln_list = []
+                    output_lines = []
+                    for cve_id, vuln in rec["vulns"].items():
+                        if not isinstance(vuln, dict):
+                            continue
+                        state = (
+                            "VULNERABLE"
+                            if vuln.get("verified")
+                            else "LIKELY VULNERABLE"
+                        )
+                        entry: dict = {"id": cve_id, "state": state}
+                        if vuln.get("summary"):
+                            entry["description"] = vuln["summary"]
+                        refs = vuln.get("references") or []
+                        if refs:
+                            # Shodan duplicates references; deduplicate
+                            seen: set = set()
+                            unique_refs: list = []
+                            for r in refs:
+                                if isinstance(r, str) and r not in seen:
+                                    seen.add(r)
+                                    unique_refs.append(r)
+                            if unique_refs:
+                                entry["refs"] = unique_refs
+                        scores: dict = {}
+                        if vuln.get("cvss_v2") is not None:
+                            scores["CVSSv2"] = str(vuln["cvss_v2"])
+                        # Shodan stores CVSSv3 in "cvss" (disambiguated by
+                        # "cvss_version" >= 3) and CVSSv2 in "cvss_v2"
+                        cvss = vuln.get("cvss")
+                        if cvss is not None and vuln.get("cvss_version", 0) >= 3:
+                            scores["CVSSv3"] = str(cvss)
+                        if scores:
+                            entry["scores"] = scores
+                        vuln_list.append(entry)
+                        output_lines.append(f"{cve_id}: {state}")
+                    if vuln_list and not any(
+                        s["id"] == "vulns" for s in port.get("scripts", [])
+                    ):
+                        port.setdefault("scripts", []).append(
+                            {
+                                "id": "vulns",
+                                "output": "\n".join(output_lines),
+                                "vulns": vuln_list,
                             }
                         )
                 # Map Shodan record tags to IVRE tags
